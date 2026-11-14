@@ -6,6 +6,7 @@ import { downloadBlob, formatBytes, savedPercent } from "@/lib/format";
 import { addUsage, remaining } from "@/lib/usage";
 
 type Fmt = "image/webp" | "image/jpeg" | "image/png" | "image/avif";
+type OutFmt = Fmt | "original";
 
 const EXT: Record<Fmt, string> = {
   "image/webp": "webp",
@@ -26,6 +27,7 @@ interface Item {
   outName?: string;
   status: "ready" | "working" | "done" | "error";
   error?: string;
+  note?: string;
 }
 
 async function compressImage(file: File, fmt: Fmt, quality: number, maxW: number): Promise<Blob> {
@@ -55,6 +57,16 @@ async function compressImage(file: File, fmt: Fmt, quality: number, maxW: number
   }
   ctx.drawImage(bmp, 0, 0, w, h);
   bmp.close();
+  if (fmt === "image/png") {
+    // Smart PNG: reduce the number of colors (like TinyPNG) to shrink the file.
+    const data = ctx.getImageData(0, 0, w, h);
+    const UPNG = (await import("upng-js")).default;
+    const cnum = quality >= 0.95 ? 0 : Math.min(256, Math.max(16, Math.round(quality * 256)));
+    const buf = UPNG.encode([data.data.buffer as ArrayBuffer], w, h, cnum);
+    canvas.width = 0;
+    canvas.height = 0;
+    return new Blob([buf], { type: "image/png" });
+  }
   const blob = await new Promise<Blob | null>((res) => canvas.toBlob(res, fmt, quality));
   canvas.width = 0;
   canvas.height = 0;
@@ -67,7 +79,7 @@ async function compressImage(file: File, fmt: Fmt, quality: number, maxW: number
 
 export default function ImagePage() {
   const [items, setItems] = useState<Item[]>([]);
-  const [fmt, setFmt] = useState<Fmt>("image/webp");
+  const [fmt, setFmt] = useState<OutFmt>("original");
   const [quality, setQuality] = useState(75);
   const [maxW, setMaxW] = useState(0);
   const [busy, setBusy] = useState(false);
@@ -150,16 +162,30 @@ export default function ImagePage() {
         skipped++;
         continue;
       }
-      patch(it.id, { status: "working", error: undefined });
+      patch(it.id, { status: "working", error: undefined, note: undefined });
       try {
-        const blob = await compressImage(it.file, fmt, quality / 100, maxW);
+        const effFmt: Fmt =
+          fmt === "original"
+            ? it.file.type === "image/avif"
+              ? "image/webp"
+              : (it.file.type as Fmt)
+            : fmt;
+        let blob: Blob = await compressImage(it.file, effFmt, quality / 100, maxW);
+        let note: string | undefined;
+        if (blob.size >= it.file.size && effFmt === it.file.type && maxW === 0) {
+          blob = it.file;
+          note = "Already well optimized, so the original was kept.";
+        } else if (fmt === "original" && it.file.type === "image/avif") {
+          note = "AVIF input was saved as WebP.";
+        }
         if (it.outUrl) URL.revokeObjectURL(it.outUrl);
         const base = it.file.name.replace(/\.[^.]+$/, "") || "image";
         patch(it.id, {
           out: blob,
           outUrl: URL.createObjectURL(blob),
-          outName: `${base}-linkpilot.${EXT[fmt]}`,
+          outName: `${base}-linkpilot.${EXT[effFmt]}`,
           status: "done",
+          note,
         });
         addUsage("image");
         left--;
@@ -222,10 +248,11 @@ export default function ImagePage() {
               <label className="label" htmlFor="fmt">
                 Output format
               </label>
-              <select id="fmt" className="input" value={fmt} onChange={(e) => setFmt(e.target.value as Fmt)}>
-                <option value="image/webp">WebP (recommended)</option>
+              <select id="fmt" className="input" value={fmt} onChange={(e) => setFmt(e.target.value as OutFmt)}>
+                <option value="original">Same as original (smart, like TinyPNG)</option>
+                <option value="image/webp">WebP (smallest for web)</option>
                 <option value="image/jpeg">JPG</option>
-                <option value="image/png">PNG (lossless, ignores quality)</option>
+                <option value="image/png">PNG (smart color reduction)</option>
                 <option value="image/avif">AVIF (only some browsers)</option>
               </select>
             </div>
@@ -239,10 +266,14 @@ export default function ImagePage() {
                 min={10}
                 max={100}
                 value={quality}
-                disabled={fmt === "image/png"}
                 onChange={(e) => setQuality(Number(e.target.value))}
                 className="w-full accent-cyan-500"
               />
+              <div className="text-xs text-slate-500">
+                {fmt === "image/png" || fmt === "original"
+                  ? "PNG: lower quality = fewer colors = smaller file. 95%+ keeps PNG lossless."
+                  : "Lower quality = smaller file."}
+              </div>
             </div>
             <div>
               <label className="label" htmlFor="mw">
@@ -326,6 +357,7 @@ export default function ImagePage() {
                   </div>
                 </div>
                 {it.status === "working" && <div className="mt-2 text-sm text-cyan-500">Compressing…</div>}
+                {it.note && <div className="mt-2 text-xs text-slate-500">{it.note}</div>}
                 {it.status === "error" && (
                   <div className="mt-2 text-sm text-red-500" role="alert">
                     {it.error}
